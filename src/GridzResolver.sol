@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {
+    AccessControlUpgradeable
+} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {IEAS, Attestation} from "./IEAS.sol";
 
 /// @notice ENSIP-10 extended resolver interface.
@@ -10,26 +15,26 @@ interface IExtendedResolver {
 
 /**
  * @title GridzResolver
- * @notice An ENSIP-10 wildcard resolver that backs `gridz.*` text records with
- *         EAS attestations. The node owner registers a cell's attestation UID;
- *         `text(node, key)` reads the attestation from EAS and returns the
- *         on-chain commitment (valueHashHex). Revoked or expired attestations
- *         resolve to the empty string. Off-chain consumers fetch the cleartext
- *         value and check it against this commitment.
+ * @notice UUPS-upgradeable ENSIP-10 wildcard resolver backing `gridz.*` text records
+ *         with EAS attestations. Role-gated writes; proxy address is stable for ENS.
  *
- * @dev Self-contained ownership (no external deps) for auditability. For
- *      production, deploy behind an OpenZeppelin UUPS proxy (see script/Deploy).
+ * @dev Follows ethskills proxy + access-control guidance: initializer (no constructor
+ *      state), disabled implementation init, role separation, storage gap for upgrades.
+ *      Transfer UPGRADER_ROLE to a multisig before mainnet (never a lone EOA).
  */
-contract GridzResolver is IExtendedResolver {
-    /// @dev EAS schema for gridz.cell.v1.
-    /// (bytes32 gridId, string key, string valueHashHex, uint64 expiresAt, bytes32 widgetTypeHash)
+contract GridzResolver is
+    Initializable,
+    UUPSUpgradeable,
+    AccessControlUpgradeable,
+    IExtendedResolver
+{
+    /// @dev Registers or clears EAS attestation UIDs for ENS nodes.
+    bytes32 public constant REGISTRAR_ROLE = keccak256("REGISTRAR_ROLE");
+    /// @dev Authorizes UUPS implementation upgrades.
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
-    address public owner;
-    IEAS public immutable eas;
-    /// @dev The registered EAS schema UID for gridz.cell.v1. Attestations under
-    ///      any other schema are ignored (defensive — prevents abi.decode reverts
-    ///      and stops a wrong-schema UID from being read as a cell).
-    bytes32 public immutable cellSchema;
+    IEAS public eas;
+    bytes32 public cellSchema;
 
     // node => keccak256(key) => attestation uid
     mapping(bytes32 => mapping(bytes32 => bytes32)) private _cellUid;
@@ -38,33 +43,48 @@ contract GridzResolver is IExtendedResolver {
     bytes4 private constant ERC165_ID = 0x01ffc9a7;
     bytes4 private constant EXTENDED_RESOLVER_ID = 0x9061b923;
 
-    event CellRegistered(bytes32 indexed node, string key, bytes32 uid);
-    event OwnershipTransferred(address indexed from, address indexed to);
+    /// @dev Reserved storage for future upgrades — append-only layout (ethskills).
+    uint256[48] private __gap;
 
-    error NotOwner();
+    event CellRegistered(bytes32 indexed node, string key, bytes32 uid);
+
     error UnsupportedResolverFunction();
     error ZeroAddress();
+    error ZeroSchema();
+    error EmptyKey();
+    error CalldataTooShort();
 
-    constructor(IEAS _eas, bytes32 _cellSchema) {
-        owner = msg.sender;
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @param _eas        EAS contract for the target network (must be non-zero).
+     * @param _cellSchema Registered `gridz.cell.v1` schema UID (must be non-zero).
+     * @param admin       Receives DEFAULT_ADMIN_ROLE, UPGRADER_ROLE, and REGISTRAR_ROLE.
+     */
+    function initialize(IEAS _eas, bytes32 _cellSchema, address admin) external initializer {
+        if (address(_eas) == address(0) || admin == address(0)) revert ZeroAddress();
+        if (_cellSchema == bytes32(0)) revert ZeroSchema();
+
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
         eas = _eas;
         cellSchema = _cellSchema;
-        emit OwnershipTransferred(address(0), msg.sender);
-    }
 
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
-
-    function transferOwnership(address newOwner) external onlyOwner {
-        if (newOwner == address(0)) revert ZeroAddress();
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(UPGRADER_ROLE, admin);
+        _grantRole(REGISTRAR_ROLE, admin);
     }
 
     /// @notice Register (or clear, with uid == 0) the EAS attestation for a cell.
-    function setCellAttestation(bytes32 node, string calldata key, bytes32 uid) external onlyOwner {
+    function setCellAttestation(bytes32 node, string calldata key, bytes32 uid)
+        external
+        onlyRole(REGISTRAR_ROLE)
+    {
+        if (bytes(key).length == 0) revert EmptyKey();
         _cellUid[node][keccak256(bytes(key))] = uid;
         emit CellRegistered(node, key, uid);
     }
@@ -83,25 +103,57 @@ contract GridzResolver is IExtendedResolver {
         if (uid == bytes32(0)) return "";
 
         Attestation memory a = eas.getAttestation(uid);
-        if (a.uid == bytes32(0)) return ""; // unknown attestation
-        if (a.schema != cellSchema) return ""; // wrong schema — refuse to decode untrusted layout
-        if (a.revocationTime != 0) return ""; // revoked
-        if (a.expirationTime != 0 && a.expirationTime < block.timestamp) return ""; // expired
+        if (a.uid == bytes32(0)) return "";
+        if (a.schema != cellSchema) return "";
+        if (a.revocationTime != 0) return "";
+        if (a.expirationTime != 0 && a.expirationTime < block.timestamp) return "";
 
-        (,, string memory valueHashHex,,) =
-            abi.decode(a.data, (bytes32, string, string, uint64, bytes32));
-        return valueHashHex;
+        // Untrusted EAS payloads: decode via external try/catch so malformed data → "".
+        try this.decodeCellValueHash(a.data) returns (string memory valueHashHex) {
+            return valueHashHex;
+        } catch {
+            return "";
+        }
+    }
+
+    /// @dev External entry for try/catch decoding of untrusted attestation bytes.
+    function decodeCellValueHash(bytes memory data)
+        external
+        pure
+        returns (string memory valueHashHex)
+    {
+        (,, valueHashHex,,) = abi.decode(data, (bytes32, string, string, uint64, bytes32));
     }
 
     /// @notice ENSIP-10 wildcard resolution. Only `text(bytes32,string)` is supported.
-    function resolve(bytes calldata, bytes calldata data) external view override returns (bytes memory) {
+    function resolve(bytes calldata, bytes calldata data)
+        external
+        view
+        override
+        returns (bytes memory)
+    {
+        if (data.length < 4) revert CalldataTooShort();
         if (bytes4(data[:4]) != TEXT_SELECTOR) revert UnsupportedResolverFunction();
         (bytes32 node, string memory key) = abi.decode(data[4:], (bytes32, string));
         return abi.encode(_text(node, key));
     }
 
-    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(AccessControlUpgradeable)
+        returns (bool)
+    {
         return interfaceId == ERC165_ID || interfaceId == TEXT_SELECTOR
-            || interfaceId == EXTENDED_RESOLVER_ID;
+            || interfaceId == EXTENDED_RESOLVER_ID || super.supportsInterface(interfaceId);
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        view
+        override
+        onlyRole(UPGRADER_ROLE)
+    {
+        if (newImplementation == address(0)) revert ZeroAddress();
     }
 }

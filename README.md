@@ -1,34 +1,61 @@
 # Gridz contracts
 
-`GridzResolver.sol` — an ENSIP-10 wildcard resolver that backs `gridz.*` text
-records with EAS attestations. The node owner registers a cell's attestation UID;
-`text(node, key)` reads it from EAS and returns the on-chain commitment
-(`valueHashHex`). Revoked, expired, or wrong-schema attestations resolve to `""`.
+`GridzResolver.sol` — a **UUPS-upgradeable**, **role-gated** ENSIP-10 wildcard resolver that
+backs `gridz.*` text records with EAS attestations. Deploy via `ERC1967Proxy`; point ENS at
+the **proxy** address so implementation upgrades do not require an ENS migration.
 
-Written following [ethskills](https://ethskills.com/) (Security + Testing skills):
-defensive handling of untrusted attestation data (schema-guarded decode so a
-wrong-schema UID can't revert or be misread), fuzz tests alongside unit tests, and
-addresses supplied by the operator at deploy time rather than hardcoded. The
-constructor takes the registered `gridz.cell.v1` schema UID, so only genuine cell
-attestations are ever decoded.
+Reviewed against [ethskills Security](https://ethskills.com/security/SKILL.md) and
+[ethskills Testing](https://ethskills.com/testing/SKILL.md).
+
+## Roles
+
+| Role | Purpose |
+|------|---------|
+| `DEFAULT_ADMIN_ROLE` | Grant/revoke roles |
+| `REGISTRAR_ROLE` | `setCellAttestation` — register EAS UIDs per ENS node/key |
+| `UPGRADER_ROLE` | Authorize UUPS implementation upgrades |
+
+The deploy script grants all three to `ADMIN_ADDRESS` (defaults to the broadcaster).
+**Before mainnet:** transfer `UPGRADER_ROLE` (and ideally `DEFAULT_ADMIN_ROLE`) to a
+multisig — never leave upgrade authority on a single hot EOA ([ethskills proxy guidance](https://ethskills.com/security/SKILL.md)).
+
+## Security properties
+
+- UUPS with `_disableInitializers()` on the implementation
+- `48`-slot storage gap for safe future upgrades (append-only layout)
+- Input validation: non-zero EAS/schema/admin, non-empty keys, non-zero upgrade target
+- Untrusted EAS attestation bytes decoded via try/catch — malformed data resolves to `""`
+- No external calls on write paths (no reentrancy surface); reads are `view`
+
+## Deploy
 
 ```bash
-forge install foundry-rs/forge-std --no-git   # first time
-forge test
-forge coverage   # GridzResolver.sol: 100% lines/statements/branches/functions
-slither src/GridzResolver.sol                 # CI gate (run with slither installed)
+EAS_ADDRESS=<network EAS> \
+CELL_SCHEMA=<gridz.cell.v1 schema UID> \
+forge script script/Deploy.s.sol --rpc-url <rpc> --broadcast --private-key <key>
 ```
 
-Deploy to a testnet (no mainnet config ships — operator's call, BRIEF §13):
-
-```bash
-EAS_ADDRESS=<network EAS> forge script script/Deploy.s.sol --rpc-url <rpc> --broadcast
-```
+Use the **proxy** address from the broadcast as `GRIDZ_RESOLVER`.
 
 | Network | EAS |
-|---|---|
+|---------|-----|
+| Mainnet | `0xC03e4De6924389f6Dfc89A41Eda71C41cd063315` |
 | Sepolia | `0xC2679fBD37d54388Ce493F1DB75320D236e1815e` |
 | Base Sepolia | `0x4200000000000000000000000000000000000021` |
-| Optimism Sepolia | `0x4200000000000000000000000000000000000021` |
 
-For production, deploy behind an OpenZeppelin UUPS proxy.
+## Upgrade
+
+```bash
+PROXY_ADDRESS=<proxy> \
+forge script script/Upgrade.s.sol --rpc-url <rpc> --broadcast --private-key <key>
+```
+
+Caller must hold `UPGRADER_ROLE` on the proxy.
+
+## Test & analyze
+
+```bash
+forge test                    # fuzz: 1000 runs (foundry.toml)
+forge coverage --report summary
+slither src/GridzResolver.sol # recommended pre-deploy (ethskills)
+```

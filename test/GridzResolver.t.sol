@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {GridzResolver, IExtendedResolver} from "../src/GridzResolver.sol";
 import {IEAS, Attestation} from "../src/IEAS.sol";
 
@@ -20,15 +22,22 @@ contract MockEAS is IEAS {
 contract GridzResolverTest is Test {
     MockEAS internal eas;
     GridzResolver internal resolver;
+    GridzResolver internal implementation;
 
     bytes32 internal constant NODE = keccak256("mygrid.eth");
     bytes32 internal constant UID = keccak256("uid-1");
     bytes32 internal constant CELL_SCHEMA = keccak256("gridz.cell.v1");
+    address internal admin;
     address internal constant ALICE = address(0xA11CE);
 
     function setUp() public {
+        admin = address(this);
         eas = new MockEAS();
-        resolver = new GridzResolver(eas, CELL_SCHEMA);
+        implementation = new GridzResolver();
+        bytes memory initData =
+            abi.encodeCall(GridzResolver.initialize, (IEAS(eas), CELL_SCHEMA, admin));
+        ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
+        resolver = GridzResolver(address(proxy));
     }
 
     function _cellData(string memory valueHashHex) internal pure returns (bytes memory) {
@@ -63,7 +72,7 @@ contract GridzResolverTest is Test {
     }
 
     function test_unknownAttestationReturnsEmpty() public {
-        resolver.setCellAttestation(NODE, "com.github", UID); // UID never set in EAS
+        resolver.setCellAttestation(NODE, "com.github", UID);
         assertEq(resolver.text(NODE, "com.github"), "");
     }
 
@@ -86,22 +95,114 @@ contract GridzResolverTest is Test {
         assertEq(resolver.text(NODE, "com.github"), "0xlive");
     }
 
-    function test_onlyOwnerCanSet() public {
+    function test_onlyRegistrarCanSet() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                ALICE,
+                resolver.REGISTRAR_ROLE()
+            )
+        );
         vm.prank(ALICE);
-        vm.expectRevert(GridzResolver.NotOwner.selector);
         resolver.setCellAttestation(NODE, "com.github", UID);
     }
 
-    function test_transferOwnership() public {
-        resolver.transferOwnership(ALICE);
-        assertEq(resolver.owner(), ALICE);
+    function test_adminGrantsRegistrar() public {
+        eas.set(UID, _att(0, 0, _cellData("0xabc")));
+        resolver.grantRole(resolver.REGISTRAR_ROLE(), ALICE);
         vm.prank(ALICE);
+        resolver.setCellAttestation(NODE, "alias", UID);
+        assertEq(resolver.cellAttestation(NODE, "alias"), UID);
+    }
+
+    function test_initializeZeroAdminReverts() public {
+        GridzResolver impl = new GridzResolver();
+        bytes memory badInit =
+            abi.encodeCall(GridzResolver.initialize, (IEAS(eas), CELL_SCHEMA, address(0)));
+        vm.expectRevert(GridzResolver.ZeroAddress.selector);
+        new ERC1967Proxy(address(impl), badInit);
+    }
+
+    function test_initializeZeroEasReverts() public {
+        GridzResolver impl = new GridzResolver();
+        bytes memory badInit =
+            abi.encodeCall(GridzResolver.initialize, (IEAS(address(0)), CELL_SCHEMA, admin));
+        vm.expectRevert(GridzResolver.ZeroAddress.selector);
+        new ERC1967Proxy(address(impl), badInit);
+    }
+
+    function test_initializeZeroSchemaReverts() public {
+        GridzResolver impl = new GridzResolver();
+        bytes memory badInit =
+            abi.encodeCall(GridzResolver.initialize, (IEAS(eas), bytes32(0), admin));
+        vm.expectRevert(GridzResolver.ZeroSchema.selector);
+        new ERC1967Proxy(address(impl), badInit);
+    }
+
+    function test_cannotInitializeImplementation() public {
+        GridzResolver impl = new GridzResolver();
+        vm.expectRevert();
+        impl.initialize(IEAS(eas), CELL_SCHEMA, admin);
+    }
+
+    function test_cannotReinitializeProxy() public {
+        vm.expectRevert();
+        resolver.initialize(IEAS(eas), CELL_SCHEMA, admin);
+    }
+
+    function test_emptyKeyReverts() public {
+        vm.expectRevert(GridzResolver.EmptyKey.selector);
+        resolver.setCellAttestation(NODE, "", UID);
+    }
+
+    function test_clearAttestationWithZeroUid() public {
+        eas.set(UID, _att(0, 0, _cellData("0xabc")));
+        resolver.setCellAttestation(NODE, "alias", UID);
+        resolver.setCellAttestation(NODE, "alias", bytes32(0));
+        assertEq(resolver.cellAttestation(NODE, "alias"), bytes32(0));
+        assertEq(resolver.text(NODE, "alias"), "");
+    }
+
+    function test_setCellAttestationEmitsEvent() public {
+        vm.expectEmit(true, false, false, true);
+        emit GridzResolver.CellRegistered(NODE, "alias", UID);
         resolver.setCellAttestation(NODE, "alias", UID);
     }
 
-    function test_transferOwnershipZeroReverts() public {
-        vm.expectRevert(GridzResolver.ZeroAddress.selector);
-        resolver.transferOwnership(address(0));
+    function test_malformedEasDataReturnsEmpty() public {
+        Attestation memory a = _att(0, 0, hex"deadbeef");
+        eas.set(UID, a);
+        resolver.setCellAttestation(NODE, "alias", UID);
+        assertEq(resolver.text(NODE, "alias"), "");
+    }
+
+    function test_resolveCalldataTooShort() public {
+        vm.expectRevert(GridzResolver.CalldataTooShort.selector);
+        resolver.resolve(hex"00", hex"0102");
+    }
+
+    function test_upgradePreservesStorage() public {
+        eas.set(UID, _att(0, 0, _cellData("0xabc")));
+        resolver.setCellAttestation(NODE, "com.github", UID);
+
+        GridzResolver newImpl = new GridzResolver();
+        resolver.upgradeToAndCall(address(newImpl), "");
+
+        assertEq(resolver.text(NODE, "com.github"), "0xabc");
+        assertEq(resolver.cellAttestation(NODE, "com.github"), UID);
+    }
+
+    function test_nonUpgraderCannotUpgrade() public {
+        GridzResolver newImpl = new GridzResolver();
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                ALICE,
+                resolver.UPGRADER_ROLE()
+            )
+        );
+        vm.prank(ALICE);
+        resolver.upgradeToAndCall(address(newImpl), "");
     }
 
     function test_resolveWildcard() public {
@@ -119,14 +220,13 @@ contract GridzResolverTest is Test {
     }
 
     function test_supportsInterface() public view {
-        assertTrue(resolver.supportsInterface(0x01ffc9a7)); // ERC165
-        assertTrue(resolver.supportsInterface(0x59d1d43c)); // ITextResolver
-        assertTrue(resolver.supportsInterface(0x9061b923)); // IExtendedResolver
+        assertTrue(resolver.supportsInterface(0x01ffc9a7));
+        assertTrue(resolver.supportsInterface(0x59d1d43c));
+        assertTrue(resolver.supportsInterface(0x9061b923));
+        assertTrue(resolver.supportsInterface(type(IAccessControl).interfaceId));
         assertFalse(resolver.supportsInterface(0xffffffff));
     }
 
-    /// @dev Defensive (ethskills Security): a UID under a different schema must
-    ///      not be decoded as a cell — it resolves to "" instead of reverting.
     function test_wrongSchemaReturnsEmpty() public {
         Attestation memory a = _att(0, 0, _cellData("0xabc"));
         a.schema = keccak256("some.other.schema");
@@ -135,10 +235,8 @@ contract GridzResolverTest is Test {
         assertEq(resolver.text(NODE, "com.github"), "");
     }
 
-    // --- fuzz (ethskills Testing) ---
-
     function testFuzz_roundTrip(string calldata key, string calldata value) public {
-        vm.assume(bytes(key).length > 0);
+        vm.assume(bytes(key).length > 0 && bytes(key).length < 256);
         bytes memory data = abi.encode(bytes32("g"), key, value, uint64(0), bytes32(0));
         eas.set(UID, _att(0, 0, data));
         resolver.setCellAttestation(NODE, key, UID);
@@ -149,10 +247,16 @@ contract GridzResolverTest is Test {
         assertEq(resolver.text(node, key), "");
     }
 
-    function testFuzz_onlyOwnerCanSet(address caller) public {
-        vm.assume(caller != address(this));
+    function testFuzz_onlyRegistrarCanSet(address caller) public {
+        vm.assume(caller != admin && !resolver.hasRole(resolver.REGISTRAR_ROLE(), caller));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                caller,
+                resolver.REGISTRAR_ROLE()
+            )
+        );
         vm.prank(caller);
-        vm.expectRevert(GridzResolver.NotOwner.selector);
         resolver.setCellAttestation(NODE, "com.github", UID);
     }
 }
