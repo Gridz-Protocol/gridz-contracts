@@ -69,7 +69,6 @@ contract GridzResolver is
         if (_cellSchema == bytes32(0)) revert ZeroSchema();
 
         __AccessControl_init();
-        __UUPSUpgradeable_init();
 
         eas = _eas;
         cellSchema = _cellSchema;
@@ -77,6 +76,18 @@ contract GridzResolver is
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(UPGRADER_ROLE, admin);
         _grantRole(REGISTRAR_ROLE, admin);
+    }
+
+    /// @notice Point the resolver at the canonical EAS deployment (admin-only fixup).
+    function setEas(IEAS _eas) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (address(_eas) == address(0)) revert ZeroAddress();
+        eas = _eas;
+    }
+
+    /// @notice Update the registered gridz.cell.v1 schema UID (admin-only fixup).
+    function setCellSchema(bytes32 _cellSchema) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_cellSchema == bytes32(0)) revert ZeroSchema();
+        cellSchema = _cellSchema;
     }
 
     /// @notice Register (or clear, with uid == 0) the EAS attestation for a cell.
