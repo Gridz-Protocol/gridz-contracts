@@ -53,6 +53,9 @@ contract GridzResolver is
     error ZeroSchema();
     error EmptyKey();
     error CalldataTooShort();
+    error InvalidAttestation();
+    error NotAttestationAttester();
+    error KeyMismatch();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -100,6 +103,31 @@ contract GridzResolver is
         emit CellRegistered(node, key, uid);
     }
 
+    /// @notice Link a cell when the caller is the EAS attester (user-paid publish).
+    /// @dev Verifies schema, key, and attester; gridz.bio editors attest + link from the wallet.
+    function linkCellAttestation(bytes32 node, string calldata key, bytes32 uid) external {
+        if (bytes(key).length == 0) revert EmptyKey();
+        if (uid == bytes32(0)) revert InvalidAttestation();
+
+        Attestation memory a = eas.getAttestation(uid);
+        if (a.uid == bytes32(0)) revert InvalidAttestation();
+        if (a.schema != cellSchema) revert InvalidAttestation();
+        if (a.revocationTime != 0) revert InvalidAttestation();
+        if (a.expirationTime != 0 && a.expirationTime < block.timestamp) revert InvalidAttestation();
+        if (a.attester != msg.sender) revert NotAttestationAttester();
+
+        string memory attKey;
+        try this.decodeCellKey(a.data) returns (string memory k) {
+            attKey = k;
+        } catch {
+            revert InvalidAttestation();
+        }
+        if (keccak256(bytes(attKey)) != keccak256(bytes(key))) revert KeyMismatch();
+
+        _cellUid[node][keccak256(bytes(key))] = uid;
+        emit CellRegistered(node, key, uid);
+    }
+
     function cellAttestation(bytes32 node, string calldata key) external view returns (bytes32) {
         return _cellUid[node][keccak256(bytes(key))];
     }
@@ -134,6 +162,11 @@ contract GridzResolver is
         returns (string memory valueHashHex)
     {
         (,, valueHashHex,,) = abi.decode(data, (bytes32, string, string, uint64, bytes32));
+    }
+
+    /// @dev External entry for try/catch key extraction from attestation bytes.
+    function decodeCellKey(bytes memory data) external pure returns (string memory key) {
+        (, key,,,) = abi.decode(data, (bytes32, string, string, uint64, bytes32));
     }
 
     /// @notice ENSIP-10 wildcard resolution. Only `text(bytes32,string)` is supported.

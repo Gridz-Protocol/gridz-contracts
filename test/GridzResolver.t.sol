@@ -259,4 +259,31 @@ contract GridzResolverTest is Test {
         vm.prank(caller);
         resolver.setCellAttestation(NODE, "com.github", UID);
     }
+
+    function test_linkCellAttestation_byAttester() public {
+        eas.set(UID, _att(0, 0, _cellData("0xabc")));
+        resolver.linkCellAttestation(NODE, "com.github", UID);
+        assertEq(resolver.text(NODE, "com.github"), "0xabc");
+    }
+
+    function test_linkCellAttestation_wrongAttesterReverts() public {
+        eas.set(UID, _att(0, 0, _cellData("0xabc")));
+        vm.expectRevert(GridzResolver.NotAttestationAttester.selector);
+        vm.prank(ALICE);
+        resolver.linkCellAttestation(NODE, "com.github", UID);
+    }
+
+    function test_linkCellAttestation_keyMismatchReverts() public {
+        eas.set(UID, _att(0, 0, _cellData("0xabc")));
+        vm.expectRevert(GridzResolver.KeyMismatch.selector);
+        resolver.linkCellAttestation(NODE, "alias", UID);
+    }
+
+    function test_linkCellAttestation_wrongSchemaReverts() public {
+        Attestation memory a = _att(0, 0, _cellData("0xabc"));
+        a.schema = keccak256("other");
+        eas.set(UID, a);
+        vm.expectRevert(GridzResolver.InvalidAttestation.selector);
+        resolver.linkCellAttestation(NODE, "com.github", UID);
+    }
 }
