@@ -13,6 +13,7 @@ import {IEAS} from "../src/IEAS.sol";
  * EAS per network:
  *   Mainnet          0xC03e4De6924389f6Dfc89A41Eda71C41cd063315
  *   Sepolia          0xC2679fBD37d54388Ce493F1DB75320D236e1815e
+ *   Base mainnet     0x4200000000000000000000000000000000000021
  *   Base Sepolia     0x4200000000000000000000000000000000000021
  *
  * Env:
